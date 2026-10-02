@@ -25,17 +25,53 @@ def haversine(lon1, lat1, lon2, lat2):
     c = 2 * np.arcsin(np.sqrt(a))
     return np.degrees(c)
 
-def ipc_write(name, ra, dec, op, p, tmin, tmax):
+ELEMENTS_LIST   = "q e inc node argPeri t_p_MJD_TDB epochMJD_TDB".split()
+ELEMENTS_LIST_MPC_ORBITS = "designation|Vmag|id|packed_primary_provisional_designation|unpacked_primary_provisional_designation|mpc_orb_jsonb|created_at|updated_at|orbit_type_int|u_param|nopp|arc_length_total|arc_length_sel|nobs_total|nobs_total_sel|a|q|e|i|node|argperi|peri_time|yarkovsky|srp|a1|a2|a3|dt|mean_anomaly|period|mean_motion|a_unc|q_unc|e_unc|i_unc|node_unc|argperi_unc|peri_time_unc|yarkovsky_unc|srp_unc|a1_unc|a2_unc|a3_unc|dt_unc|mean_anomaly_unc|period_unc|mean_motion_unc|epoch_mjd|h|g|not_normalized_rms|normalized_rms|earth_moid|fitting_datetime".split('|')
+ELEMENTS_FORMAT = " ".join([ "{:> 11f}" ] * len(ELEMENTS_LIST))
+HEADER_FORMAT = "{:>11s} {:>11s} {:>11s} {:>11s} {:>11s} {:>13s}  {:>12s}"
+
+def ipc_write(name, ra, dec, op, p, tmin, tmax, elements):
     # fast pyarrow IPC serialization
     outbuf = io.BytesIO()
     out = pa.output_stream(outbuf)
     a = pa.Tensor.from_numpy(p);   pa.ipc.write_tensor(a, out)
     a = pa.Tensor.from_numpy(op);  pa.ipc.write_tensor(a, out)
     data = [ pa.array(name), pa.array(ra), pa.array(dec), pa.array(np.ones_like(ra) * tmin), pa.array(np.ones_like(ra) * tmax)]
-    batch = pa.record_batch(data, names=['name', 'ra', 'dec', 'tmin', 'tmax'])
+    names = ['name', 'ra', 'dec', 'tmin', 'tmax']
+
+    # add the columns from elements, if passed
+    if elements is not None:
+        if "mpc_orb_jsonb" in elements.columns:
+            colnames = ELEMENTS_LIST_MPC_ORBITS
+        else:
+            colnames = ELEMENTS_LIST
+            if len(elements) == 0:
+                # force dtypes so old clients that don't set zero_copy_only=False
+                # deserialize correctly
+                elements = elements.astype("float64")
+        for col in colnames:
+            data.append(pa.array(elements[col].values))
+            names.append(col)
+
+    batch = pa.record_batch(data, names=names)
     with pa.ipc.new_stream(out, batch.schema) as writer:
       writer.write_batch(batch)
     return outbuf.getvalue()
+
+dtype_mapping = {
+    pa.int8(): pd.Int8Dtype(),
+    pa.int16(): pd.Int16Dtype(),
+    pa.int32(): pd.Int32Dtype(),
+    pa.int64(): pd.Int64Dtype(),
+    pa.uint8(): pd.UInt8Dtype(),
+    pa.uint16(): pd.UInt16Dtype(),
+    pa.uint32(): pd.UInt32Dtype(),
+    pa.uint64(): pd.UInt64Dtype(),
+    pa.bool_(): pd.BooleanDtype(),
+    pa.float32(): pd.Float32Dtype(),
+    pa.float64(): pd.Float64Dtype(),
+    pa.string(): pd.StringDtype(),
+}
 
 def ipc_read(msg):
     with pa.input_stream(memoryview(msg)) as fp:
@@ -46,12 +82,28 @@ def ipc_read(msg):
             schema = reader.schema
             r = next(reader)
 
-    return r["name"].to_numpy(zero_copy_only=False), r["ra"].to_numpy(), r["dec"].to_numpy(), p.to_numpy(), op.to_numpy()
+    # construct an elements pandas dataframe
+    if "q" in schema.names:
+        if "mpc_orb_jsonb" in schema.names:
+            colnames = ELEMENTS_LIST_MPC_ORBITS
+        else:
+            colnames = ELEMENTS_LIST
+        cols = { col: r[col].to_pandas(types_mapper=dtype_mapping.get) for col in colnames }
+        elements = pd.DataFrame(cols)
+    else:
+        elements = None
+
+    return r["name"].to_numpy(zero_copy_only=False), r["ra"].to_numpy(), r["dec"].to_numpy(), p.to_numpy(), op.to_numpy(), elements
 
 def utc_to_night(mjd, obscode='X05'):
     assert obscode == 'X05'
     localtime = mjd - 4./24.  ## hack to convert UTC to ~approx local time for Chile (need to do this better...)
-    night = (localtime - 0.5).astype(int)
+
+    if isinstance(localtime, np.ndarray):
+        night = (localtime - 0.5).astype(int)
+    else:
+        night = int(localtime - 0.5)
+
     return night
 
 def build_healpix_index(comps, nside, dt_minutes=5):
@@ -76,7 +128,7 @@ def build_healpix_index(comps, nside, dt_minutes=5):
     # compute position vector
     (tmin, tmax), op, p, objects = comps
     t = np.arange(tmin, tmax, dt_minutes/(24*60))
-    objects, xyz = decompress(t, comps, return_ephem=False)
+    objects, (xyz, _) = decompress(t, comps, return_ephem=False)
 
     # compute healpix pixel corresponding to this vector
     x, y, z = xyz
@@ -119,7 +171,7 @@ def compress(df, cheby_order = 3, observer_cheby_order = 7):
     assert len(df) % nobj == 0, "All objects must have been observed at the same times"
 
     # extract times
-    t = df["fieldMJD_TAI"].values[0:nobs]
+    t = df["fieldMJD_TAI"].to_numpy(copy=True)[:nobs]
     tmin, tmax = t.min(), t.max()
     t -= tmin
     assert np.max(t) < 1.0#np.all(np.round(t) == 0), "Hmmm... the adjusted times should span [0, 1) day range"
@@ -178,6 +230,8 @@ def cart_to_sph(xyz):
 
     return ra, dec
 
+import numpy as np
+
 def decompress(t_mjd, comps, return_ephem=False):
     (tmin, tmax), op, p, objects = comps
 
@@ -186,14 +240,14 @@ def decompress(t_mjd, comps, return_ephem=False):
         raise Exception(f"The interpolation is valid from {tmin} to {tmax}")
     t = t_mjd - tmin
 
-    oxyz2 = np.polynomial.chebyshev.chebval(t, op)  # Decompress topo position
-    axyz2 = np.polynomial.chebyshev.chebval(t, p)   # Decompress asteroid position
-    xyz = axyz2 - oxyz2[:, np.newaxis]              # Obs-Ast vector
+    oxyz2 = np.polynomial.chebyshev.chebval(t, op)  # Decompress topo position (r_observer)
+    axyz2 = np.polynomial.chebyshev.chebval(t, p)   # Decompress asteroid position (r)
+    xyz = axyz2 - oxyz2[:, np.newaxis]              # Obs-Ast vector (delta_topo)
 
     if not return_ephem:
-        return objects, xyz
+        return objects, (xyz, axyz2)
     else:
-        return objects, xyz, cart_to_sph(xyz)
+        return objects, (xyz, axyz2), cart_to_sph(xyz)
 
 def merge_comps(compslist):
     from tqdm import tqdm
@@ -455,8 +509,82 @@ def find_comp(comps, idx, t):
 
     raise Exception(f"t={t} not in available ranges ({tminmax})")
 
+def hg_apparent_mag(r_helio, delta_topo, H, G):
+    """
+    Vectorized IAU H–G apparent magnitude.
 
-def query(comps, idx, t, ra, dec, radius, use_index=True):
+    Parameters
+    ----------
+    r_helio : ndarray
+        Heliocentric vectors Sun->asteroid, shape (3,) or (3, nobs), AU
+    delta_topo : ndarray
+        Topocentric vectors observer->asteroid, shape (3,) or (3, nobs), AU
+    H : float or ndarray
+        Absolute magnitude(s), shape () or (nobs,)
+    G : float or ndarray
+        Slope parameter(s), shape () or (nobs,)
+
+    Returns
+    -------
+    V : ndarray
+        Apparent V-band magnitude(s), shape (nobs,)
+    """
+
+    r_helio = np.asarray(r_helio)
+    delta_topo = np.asarray(delta_topo)
+    H = np.asarray(H)
+    G = np.asarray(G)
+
+    # Ensure 2D vector form: (3, nobs)
+    if r_helio.ndim == 1:
+        r_helio = r_helio[:, None]
+    if delta_topo.ndim == 1:
+        delta_topo = delta_topo[:, None]
+
+    # Distances
+    r = np.linalg.norm(r_helio, axis=0)
+    d = np.linalg.norm(delta_topo, axis=0)
+
+    # Phase angle
+    cos_alpha = np.sum(r_helio * delta_topo, axis=0) / (r * d)
+    cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
+    alpha = np.arccos(cos_alpha)  # radians
+
+    tan_half = np.tan(alpha / 2.0)
+
+    # H–G phase functions
+    phi1 = np.exp(-3.33 * tan_half**0.63)
+    phi2 = np.exp(-1.87 * tan_half**1.22)
+
+    phase = (1.0 - G) * phi1 + G * phi2
+
+    # Apparent magnitude
+    V = H + 5.0 * np.log10(r * d) - 2.5 * np.log10(phase)
+    return V
+
+def numpy_struct_to_pandas_dtype_map(npdt):
+    out = {}
+    for name in npdt.names:
+        dt = npdt.fields[name][0]
+        k = dt.kind
+
+        if k in "iu":
+            out[name] = "Int64"
+        elif k == "f":
+            out[name] = "Float64"
+        elif k == "b":
+            out[name] = "boolean"
+        elif k in "SUO":
+            out[name] = "string"
+        elif k == "M":
+            out[name] = "datetime64[ns]"
+        else:
+            # fallback — rarely needed
+            out[name] = "object"
+
+    return out
+
+def query(comps, idx, t, ra, dec, radius, catalog):
     # find the right night
     comps, idx = find_comp(comps, idx, t)
 
@@ -478,7 +606,8 @@ def query(comps, idx, t, ra, dec, radius, use_index=True):
         comps2 = comps
 
     # decompress for a single time
-    objects, xyz = decompress(t, comps2, return_ephem=False)
+    objects, (xyz, r_helio) = decompress(t, comps2, return_ephem=False)
+    delta_topo = xyz.copy() # save it for magnitude computation later
 
     # turn to a unit vector
     r = np.sqrt((xyz*xyz).sum(axis=0))
@@ -492,14 +621,53 @@ def query(comps, idx, t, ra, dec, radius, use_index=True):
     # select the results
     _, op, p, _ = comps2
     name, (ra, dec), p = objects[mask], cart_to_sph(xyz[:, mask]), p[:, :, mask]
-    return name, ra, dec, p, op, tmin, tmax
+    
+    # match elements, if requested
+    if catalog is not None:
+        if isinstance(catalog, pd.DataFrame):
+            elements = catalog.loc[name]
+        else:
+            con = catalog
+            idxcol = "unpacked_primary_provisional_designation" if (np.char.find(name, " ") >= 0).any() else "packed_primary_provisional_designation"
 
-def query_service(url, t, ra, dec, radius):
+            placeholders = ",".join(["?"] * len(name))
+            from .schema import mpc_orbitsDtype
+            query = f"SELECT * FROM mpc_orbits WHERE {idxcol} IN ({placeholders})"
+            elements = pd.read_sql_query(query, con, params=name, dtype=numpy_struct_to_pandas_dtype_map(mpc_orbitsDtype))
+            elements = elements.set_index(idxcol).loc[name].reset_index()
+
+#            # resort with vectorized numpy (doesn't appear to be any faster than above)
+#            designations = elements["designation"].to_numpy()
+#            order = np.argsort(designations)
+#            idx = order[np.searchsorted(designations[order], name)]
+#            elements = elements.take(idx)
+
+#            # resort with dict  (doesn't appear to be any faster than above)
+#            designations = elements["designation"].values
+#            pos = {v: i for i, v in enumerate(designations)}
+#            idx = np.fromiter((pos[v] for v in name), dtype=np.int64)
+#            elements = elements.iloc[idx]
+
+            # make sure all rows are properly aligned
+            assert np.all(name == elements[idxcol].to_numpy())
+
+        # compute Vmag if (H, G) are available
+        if "h" in elements and "g" in elements:
+            # if we read from the full mpc_orbits, it means we have g and h
+            # so can compute the magnitude
+            elements["Vmag"] = hg_apparent_mag(r_helio[:, mask], delta_topo[:, mask], elements["h"], elements["g"])
+    else:
+        elements = None
+
+    return name, ra, dec, p, op, tmin, tmax, elements
+
+def query_service(url, t, ra, dec, radius, return_elements):
     params = {
         "t": t,
         "ra": ra,
         "dec": dec,
-        "radius": radius
+        "radius": radius,
+        "return_elements": return_elements
     }
 
     # Sending a GET request to the endpoint
@@ -517,6 +685,10 @@ def cmd_serve(args):
     # This will be read by the Settings in the service
     import os
     os.environ["CACHE_PATH"] = args.cache_path
+    os.environ["DATASTORE_URL"] = args.datastore_url
+    os.environ["CATALOG_PATH"] = args.catalog
+    os.environ["MAX_LOADED_NIGHTS"] = str(args.max_loaded_nights)
+    os.environ["MAX_ONDISK_NIGHTS"] = str(args.max_ondisk_nights)
 
     if args.verbose:
         import os.path
@@ -530,11 +702,12 @@ def cmd_serve(args):
 
 def cmd_query(args):
     if args.source.startswith("http://") or args.source.startswith("https://"):
+        args.source = _fix_mpsky_url_suffix(args.source) + "/ephemerides"
         # remote service query
         assert not args.no_index, "Only valid for local queries"
         try:
             t0 = time.perf_counter()
-            name, ra, dec, p, op = query_service(args.source, args.t, args.ra, args.dec, args.radius)
+            name, ra, dec, p, op, elements = query_service(args.source, args.t, args.ra, args.dec, args.radius, args.return_elements)
             duration = time.perf_counter() - t0
         except requests.exceptions.HTTPError as e:
             print(f"Error (status={e.response.status_code}): {e.response.text}", file=sys.stderr)
@@ -547,32 +720,104 @@ def cmd_query(args):
             idx = None
 
         t0 = time.perf_counter()
-        name, ra, dec, p, op = query(comps, idx, args.t, args.ra, args.dec, args.radius)
+        name, ra, dec, p, op, elements = query(comps, idx, args.t, args.ra, args.dec, args.radius, catalog)
         duration = time.perf_counter() - t0
 
     if args.format == "json":
         import json
-        js = json.dumps({'name': name.tolist(), 'ra:': ra.tolist(), 'dec': dec.tolist(), 'ast_cheby': p.tolist(), 'topo_cheby': op.tolist()})
-        print(js)
+#        js = json.dumps({'name': name.tolist(), 'ra:': ra.tolist(), 'dec': dec.tolist(), 'ast_cheby': p.tolist(), 'topo_cheby': op.tolist()})
+#        print(js)
+        cols = dict(name=name, ra=ra, dec=dec)
+        df = pd.DataFrame(cols)
+        if elements is not None:
+            df = pd.concat([df, elements], axis=1)
+        df["ast_cheby"] = [ p[:, :, i].T.tolist() for i in range(p.shape[2]) ]
+
+        # change all timestamp fields to strings
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = df[col].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        data = {
+            "ast": df.to_dict(orient="records"),
+            "topo_cheby": op.T.tolist()
+        }
+#        data = dict(ast=df, topo_cheby=op.T.tolist())
+#        print(df.to_json(orient="records"))
+        print(json.dumps(data))
     elif args.format == "table":
         # print the results
         dist = haversine(ra, dec, args.ra, args.dec)
-        print("#   object            ra           dec          dist")
-        for n, r, d, dd in zip(name, ra, dec, dist):
-            print(f"{n:10s} {r:13.8f} {d:13.8f} {dd:13.8f}")
+        if elements is None:
+            print("#   object            ra           dec       dist")
+            for n, r, d, dd in zip(name, ra, dec, dist):
+                print(f"{n:10s} {r:13.8f} {d:13.8f} {dd:10.6f}")
+        else:
+            Vmag = elements["Vmag"] if "Vmag" in elements.columns else np.full(len(dist), np.nan)
+            print(("#   object            ra           dec   Vmag       dist " + HEADER_FORMAT).format(*ELEMENTS_LIST))
+            if "mpc_orb_jsonb" in elements.columns:
+                # rename the columns
+                elements.rename(columns={"i": "inc", "argperi": "argPeri", "peri_time":"t_p_MJD_TDB", "epoch_mjd":"epochMJD_TDB", "unpacked_primary_provisional_designation": "ObjID"}, inplace=True)
+            for values in zip(name, ra, dec, Vmag, dist, *elements[ELEMENTS_LIST].to_numpy().T):
+                print(("{:10s} {:13.8f} {:13.8f} {:6.3f} {:10.6f} " + ELEMENTS_FORMAT).format(*values))
         assert np.all(dist <= args.radius)
         print(f"# objects: {len(name)}")
-        print(f"# compute time: {duration*1000:.2f}msec")
+        print(f"# query time: {duration*1000:.2f}msec")
         print(f"# source: {args.source}")
     else:
         assert False, f"uh, oh, this should not happen. Format {args.format=} is unrecognized."
 
+def _fetch_server_version(source: str) -> dict:
+    base = source.rstrip("/")
+    url = f"{base}/version"
+
+    r = requests.get(url, headers={"Accept": "application/json"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def cmd_server_version(args) -> int:
+    data = _fetch_server_version(args.source)
+
+    if args.format == "json":
+        import json
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+
+    # text output: one key/value per line, stable order for the common fields
+    preferred = ["version", "commit_id"]
+    for k in preferred:
+        if k in data:
+            print(f"{k}: {data[k]}")
+
+    for k in sorted(set(data.keys()) - set(preferred)):
+        print(f"{k}: {data[k]}")
+
+    return 0
+
+def _fix_mpsky_url_suffix(url):
+    suffix = "/ephemerides"
+    if url.rstrip("/").endswith(suffix):
+        url = url.rstrip("/")[: -len(suffix)]
+        print(f"warning: the service URL you passed points to the /ephemerides endpoint. It should point to the base URL of the mpsky service instead. Please change it to point to '{url}' instead.")
+
+    return url
+
 def main():
     import argparse
+    import signal
+
+    # don't vomit exceptions when a pipe is broken (i.e., when piped to `head`)
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    # Read the default base URL.
+    # Backwards compatibility: if the URL ends in ephemerides/ or ephemerides,
+    # strip it and emit a warning.
+    url = _fix_mpsky_url_suffix(os.getenv("MPSKY_URL", 'https://sky.dirac.dev/'))
 
     # Create the top-level parser
-    parser = argparse.ArgumentParser(description='Asteroid Checker.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    subparsers = parser.add_subparsers(dest='command', required=True, help='Subcommands')
+    parser = argparse.ArgumentParser(description='Look up asteroids in a given field.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--version", action="store_true", help="Print version and exit.",)
+    subparsers = parser.add_subparsers(dest='command', help='Subcommands')
 
     # Create the parser for the "compress" command
     parser_build = subparsers.add_parser('build', help='Compress ephemerides files.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -583,12 +828,16 @@ def main():
     # Create the parser for the "serve" command
     # Shorthand for running `uvicorn service:app --reload --log-config=log_conf.yaml`
     parser_serve = subparsers.add_parser('serve', help='Serve data via an HTTP interface', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser_serve.add_argument('cache_path', type=str, nargs='?', default="today.mpsky.bin", help='Cache file to read from')
+    parser_serve.add_argument('cache_path', type=str, nargs='?', default="", help='Cache file to read from')
     parser_serve.add_argument('--host', type=str, default="127.0.0.1", help='Hostname or IP to bind to.')
     parser_serve.add_argument('--port', type=int, default=8000, help='Port to bind to.')
     parser_serve.add_argument('--reload', action='store_true', default=False, help='Automatically reload.')
     parser_serve.add_argument('--log-config', type=str, help='Uvicorn logging configuration file.')
     parser_serve.add_argument('--verbose', action='store_true', default=False, help='Activate verbose logging.')
+    parser_serve.add_argument('--catalog', type=str, default="", help='Catalog file with additional data corresponding to the objects in cache.')
+    parser_serve.add_argument('--datastore', dest="datastore_url", type=str, default="https://epyc.astro.washington.edu/~mjuric/mpsky-data", help='Data store of nightly caches (URL).')
+    parser_serve.add_argument('--max-loaded-nights', type=int, default=7, help='Maximum number of nights to keep serving from memory')
+    parser_serve.add_argument('--max-ondisk-nights', type=int, default=14, help='Maximum number of nights to keep downloaded in the disk cache')
 
     # Create the parser for the "query" command
     parser_query = subparsers.add_parser('query', help='Query data', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -596,13 +845,28 @@ def main():
     parser_query.add_argument('ra', type=float, help='Right ascension (degrees)')
     parser_query.add_argument('dec', type=float, help='Declination (degrees)')
     parser_query.add_argument('--radius', type=float, default=1, help='Search radius (degrees)')
+    parser_query.add_argument("--return-elements", nargs="?", const="extended", choices=("none", "basic", "extended"), default="none", help="Return orbital elements with the ephemerides: none (default), basic, or extended. If used without value, defaults to 'extended'",)
     parser_query.add_argument('--no-index', action='store_true', default=False, help='Do not use the healpix index.')
     parser_query.add_argument('--format', type=str, choices=['table', 'json'], default='table', help='Output format.')
-    url = os.getenv("MPSKY_URL", 'https://sky.dirac.dev/ephemerides/')
-    parser_query.add_argument('--source', type=str, nargs='?', const=url, default=url, help=f'Local ephemerides cache file or service endpoint URL.')
+    parser_query.add_argument('--source', type=str, nargs='?', const=url, default=url, help=f'Local ephemerides cache file or service base URL.')
+
+    # Create the parser for the "server-version" command
+    parser_server_version = subparsers.add_parser("server-version", help="Fetch and display remote server version information", formatter_class=argparse.ArgumentDefaultsHelpFormatter,)
+    parser_server_version.add_argument("--source", type=str, nargs="?", const=url, default=url, help="Service base URL.",)
+    parser_server_version.add_argument("--format", type=str, choices=("text", "json"), default="text", help="Output format.",)
 
     # Parse the arguments
     args = parser.parse_args()
+
+    if args.version and args.command is None:
+        from . import _version
+        print("version:", _version.__version__)
+        print("commit_id:", _version.__commit_id__)
+        sys.exit(0)
+
+    if args.command is None:
+       parser.error("a subcommand is required (unless --version is given)")
+       sys.exit(1)
 
     # Check which command is being requested and call the appropriate function/handler
     if args.command == 'build':
@@ -611,6 +875,8 @@ def main():
         return cmd_query(args)
     elif args.command == 'serve':
         return cmd_serve(args)
+    elif args.command == 'server-version':
+        return cmd_server_version(args)
 
 if __name__ == '__main__':
     main()
