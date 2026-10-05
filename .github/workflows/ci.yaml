@@ -26,6 +26,8 @@ jobs:
         id: build
         with:
           image: ${{ github.repository }}
+          context: .
+          dockerfile: "docker/Dockerfile"
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - run: echo Pushed ghcr.io/${{ github.repository }}:${{ steps.build.outputs.tag }}
